@@ -8,6 +8,7 @@ class SupabaseManager {
     
     var session: Session?
     var children: [Child] = []
+    var participants: [Participant] = []
     var chores: [Chore] = []
     var calendars: [CalendarInfo] = []
     var selectedCalendarId: String = UserDefaults.standard.string(forKey: "selectedCalendarId") ?? "primary" {
@@ -31,12 +32,49 @@ class SupabaseManager {
                 }
                 
                 if session != nil {
-                    await fetchChildren()
+                    await fetchParticipants()
                     await fetchChores()
                     await fetchCalendars()
                     subscribeToChores() // Start real-time subscription
                 }
             }
+        }
+    }
+
+    func fetchParticipants() async {
+        isLoading = true
+        defer { isLoading = false }
+        
+        do {
+            // 1. Fetch Children
+            let fetchedChildren: [Child] = try await supabase
+                .from("children")
+                .select()
+                .execute()
+                .value
+            self.children = fetchedChildren
+            
+            // 2. Fetch Family Members (Users)
+            // We'll need the familyId first. Currently we fetch all members, ideally filtered by family.
+            let members: [FamilyMemberResponse] = try await supabase
+                .from("family_members")
+                .select("user_id, profiles(first_name)")
+                .execute()
+                .value
+            
+            // Map to Participants
+            let childParticipants = fetchedChildren.map { Participant(id: $0.id, name: $0.name, color: $0.color, isUser: false) }
+            
+            let userParticipants = members.map { m in
+                let uid = m.userId
+                let firstName = m.profiles?.firstName
+                let displayName = firstName ?? "User " + uid.prefix(4)
+                return Participant(id: uid, name: displayName, color: "#8e8e93", isUser: true)
+            }
+            
+            self.participants = childParticipants + userParticipants
+        } catch {
+            print("Error fetching participants: \(error)")
         }
     }
 
@@ -227,11 +265,29 @@ class SupabaseManager {
     
     func toggleChore(_ chore: Chore) async {
         do {
-            try await supabase
-                .from("chores")
-                .update(["is_completed": !chore.isCompleted])
-                .eq("id", value: chore.id)
-                .execute()
+            if chore.recurrence == "none" {
+                // Regular chore: toggle isCompleted
+                try await supabase
+                    .from("chores")
+                    .update(["is_completed": !chore.isCompleted])
+                    .eq("id", value: chore.id)
+                    .execute()
+            } else {
+                // Recurring chore: toggle last_completed_at for today
+                let isCurrentlyDoneToday = if let last = chore.lastCompletedAt {
+                    Calendar.current.isDate(last, inSameDayAs: Date())
+                } else {
+                    false
+                }
+                
+                let newDate: Date? = isCurrentlyDoneToday ? nil : Date()
+                
+                try await supabase
+                    .from("chores")
+                    .update(["last_completed_at": newDate])
+                    .eq("id", value: chore.id)
+                    .execute()
+            }
             
             await fetchChores()
         } catch {
