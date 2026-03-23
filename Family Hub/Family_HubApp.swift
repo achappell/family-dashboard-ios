@@ -16,7 +16,15 @@ let supabase: SupabaseClient = {
           let url = URL(string: urlString) else {
         fatalError("Supabase configuration missing in Secrets.plist")
     }
-    return SupabaseClient(supabaseURL: url, supabaseKey: key)
+    return SupabaseClient(
+        supabaseURL: url,
+        supabaseKey: key,
+        options: SupabaseClientOptions(
+            auth: SupabaseClientOptions.AuthOptions(
+                emitLocalSessionAsInitialSession: true
+            )
+        )
+    )
 }()
 
 @main
@@ -24,6 +32,16 @@ struct Family_HubApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .onOpenURL { url in
+                    Task {
+                        do {
+                            try await supabase.auth.session(from: url)
+                            await SupabaseManager.shared.checkSession()
+                        } catch {
+                            print("Error handling OAuth callback: \(error)")
+                        }
+                    }
+                }
         }
     }
 }
