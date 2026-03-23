@@ -40,6 +40,17 @@ class SupabaseManager {
             }
         }
     }
+    
+    func checkSession() async {
+        do {
+            let session = try await supabase.auth.session
+            await MainActor.run {
+                self.session = session
+            }
+        } catch {
+            print("No active session: \(error)")
+        }
+    }
 
     func fetchParticipants() async {
         isLoading = true
@@ -54,15 +65,13 @@ class SupabaseManager {
                 .value
             self.children = fetchedChildren
             
-            // 2. Fetch Family Members (Users)
-            // We'll need the familyId first. Currently we fetch all members, ideally filtered by family.
+            // 2. Fetch Family Members (Users) joined with Profiles
             let members: [FamilyMemberResponse] = try await supabase
                 .from("family_members")
                 .select("user_id, profiles(first_name)")
                 .execute()
                 .value
             
-            // Map to Participants
             let childParticipants = fetchedChildren.map { Participant(id: $0.id, name: $0.name, color: $0.color, isUser: false) }
             
             let userParticipants = members.map { m in
@@ -75,67 +84,6 @@ class SupabaseManager {
             self.participants = childParticipants + userParticipants
         } catch {
             print("Error fetching participants: \(error)")
-        }
-    }
-
-    private var choresChannel: RealtimeChannelV2?
-
-    func subscribeToChores() {
-        if let existing = choresChannel {
-            Task { await supabase.removeChannel(existing) }
-        }
-
-        let channel = supabase.channel("public:chores")
-        let changes = channel.postgresChange(AnyAction.self, schema: "public", table: "chores")
-        
-        Task {
-            for await action in changes {
-                await MainActor.run {
-                    do {
-                        switch action {
-                        case .insert(let insertAction):
-                            let newChore = try insertAction.decodeRecord(as: Chore.self, decoder: JSONDecoder())
-                            print("Real-time INSERT: \(newChore.title)")
-                            self.chores.append(newChore)
-                            
-                        case .update(let updateAction):
-                            let updatedChore = try updateAction.decodeRecord(as: Chore.self, decoder: JSONDecoder())
-                            print("Real-time UPDATE: \(updatedChore.title) (Completed: \(updatedChore.isCompleted))")
-                            if let index = self.chores.firstIndex(where: { $0.id == updatedChore.id }) {
-                                self.chores[index] = updatedChore
-                            }
-                            
-                        case .delete(let deleteAction):
-                            if case .string(let id) = deleteAction.oldRecord["id"] {
-                                print("Real-time DELETE: \(id)")
-                                self.chores.removeAll(where: { $0.id == id })
-                            }
-                        }
-                    } catch {
-                        print("Error decoding real-time chore: \(error)")
-                    }
-                }
-            }
-        }
-        
-        Task {
-            do {
-                try await channel.subscribeWithError()
-            } catch {
-                print("Error subscribing to realtime channel: \(error)")
-            }
-        }
-        self.choresChannel = channel
-    }
-    
-    func checkSession() async {
-        do {
-            let session = try await supabase.auth.session
-            await MainActor.run {
-                self.session = session
-            }
-        } catch {
-            print("No active session: \(error)")
         }
     }
 
@@ -210,6 +158,7 @@ class SupabaseManager {
             try await supabase.auth.signOut()
             self.session = nil
             self.children = []
+            self.participants = []
             self.chores = []
             self.calendars = []
         } catch {
@@ -226,7 +175,7 @@ class SupabaseManager {
                 .insert(newChild)
                 .execute()
             
-            await fetchChildren()
+            await fetchParticipants()
         } catch {
             self.error = error
             print("Error adding child: \(error)")
@@ -241,7 +190,7 @@ class SupabaseManager {
                 .eq("id", value: child.id)
                 .execute()
             
-            await fetchChildren()
+            await fetchParticipants()
         } catch {
             self.error = error
             print("Error updating child: \(error)")
@@ -256,7 +205,7 @@ class SupabaseManager {
                 .eq("id", value: child.id)
                 .execute()
             
-            await fetchChildren()
+            await fetchParticipants()
         } catch {
             self.error = error
             print("Error deleting child: \(error)")
@@ -266,14 +215,12 @@ class SupabaseManager {
     func toggleChore(_ chore: Chore) async {
         do {
             if chore.recurrence == "none" {
-                // Regular chore: toggle isCompleted
                 try await supabase
                     .from("chores")
                     .update(["is_completed": !chore.isCompleted])
                     .eq("id", value: chore.id)
                     .execute()
             } else {
-                // Recurring chore: toggle last_completed_at for today
                 let isCurrentlyDoneToday = if let last = chore.lastCompletedAt {
                     Calendar.current.isDate(last, inSameDayAs: Date())
                 } else {
@@ -288,7 +235,8 @@ class SupabaseManager {
                     .eq("id", value: chore.id)
                     .execute()
             }
-            
+            // We don't strictly need fetchChores here if real-time is working,
+            // but it's good for immediate local confirmation.
             await fetchChores()
         } catch {
             self.error = error
@@ -365,6 +313,66 @@ class SupabaseManager {
             print("Error fetching Google events: \(error)")
             return []
         }
+    }
+
+    private var choresChannel: RealtimeChannelV2?
+
+    func subscribeToChores() {
+        if let existing = choresChannel {
+            Task { await supabase.removeChannel(existing) }
+        }
+
+        let channel = supabase.channel("public:chores")
+        
+        // IMPORTANT: Must call postgresChange BEFORE subscribeWithError
+        let changes = channel.postgresChange(AnyAction.self, schema: "public", table: "chores")
+        
+        Task {
+            for await action in changes {
+                await MainActor.run {
+                    do {
+                        switch action {
+                        case .insert(let insertAction):
+                            let decoder = JSONDecoder()
+                            decoder.dateDecodingStrategy = .iso8601
+                            let newChore = try insertAction.decodeRecord(as: Chore.self, decoder: decoder)
+                            print("Real-time INSERT: \(newChore.title)")
+                            if !self.chores.contains(where: { $0.id == newChore.id }) {
+                                self.chores.append(newChore)
+                            }
+                            
+                        case .update(let updateAction):
+                            let decoder = JSONDecoder()
+                            decoder.dateDecodingStrategy = .iso8601
+                            let updatedChore = try updateAction.decodeRecord(as: Chore.self, decoder: decoder)
+                            print("Real-time UPDATE: \(updatedChore.title) (Completed: \(updatedChore.lastCompletedAt != nil))")
+                            if let index = self.chores.firstIndex(where: { $0.id == updatedChore.id }) {
+                                self.chores[index] = updatedChore
+                            }
+                            
+                        case .delete(let deleteAction):
+                            if case .string(let id) = deleteAction.oldRecord["id"] {
+                                print("Real-time DELETE: \(id)")
+                                self.chores.removeAll(where: { $0.id == id })
+                            }
+                        }
+                    } catch {
+                        print("Error decoding real-time chore: \(error)")
+                    }
+                }
+            }
+        }
+        
+        Task {
+            do {
+                try await Task.sleep(nanoseconds: 500_000_000) // 0.5s delay
+                try await channel.subscribeWithError()
+                print("Subscribed to chores channel successfully")
+            } catch {
+                print("Error subscribing to realtime channel: \(error)")
+            }
+        }
+        self.choresChannel = channel
     }
 }
 
